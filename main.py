@@ -2,7 +2,7 @@ import asyncio
 import csv
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor  # Changed to ProcessPoolExecutor
 from playwright.async_api import async_playwright
 import time
 from datetime import datetime
@@ -10,13 +10,13 @@ import os
 
 # Configuration
 QUERIES = [
-    "toys shops"
+    "toys shops",
     "gift shops", 
     "toy stores",
     "children toys",
     "kids toys"
 ]
-MAX_WORKERS = 30
+MAX_WORKERS = 500  # Increased to 500
 OUTPUT_CSV = "toy_shops_pune_detailed.csv"
 OUTPUT_JSON = "toy_shops_pune_detailed.json"
 
@@ -316,7 +316,7 @@ async def scrape_location_query(location, location_type, query, worker_id):
         return []
 
 def run_scraping_task(location, location_type, query, worker_id):
-    """Wrapper to run async scraping in thread"""
+    """Wrapper to run async scraping in process"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -325,8 +325,8 @@ def run_scraping_task(location, location_type, query, worker_id):
         loop.close()
 
 def main():
-    """Main function to orchestrate multithreaded scraping"""
-    print("Starting multithreaded Google Maps scraper...")
+    """Main function to orchestrate multiprocess scraping"""
+    print("Starting multiprocess Google Maps scraper...")
     print(f"Configuration: {MAX_WORKERS} workers, {len(QUERIES)} queries")
     
     # Read pincodes and cities
@@ -361,17 +361,16 @@ def main():
     start_time = time.time()
     total_results = 0
     
-    # Process tasks with thread pool
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    # Process tasks with process pool
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = []
         
         for i, (location, location_type, query) in enumerate(tasks):
             worker_id = (i % MAX_WORKERS) + 1
             future = executor.submit(run_scraping_task, location, location_type, query, worker_id)
             futures.append(future)
-            
-            # Add small delay between task submissions
-            time.sleep(1)
+            # Remove or reduce delay for faster submission
+            # time.sleep(1)
         
         # Wait for all tasks to complete
         for i, future in enumerate(futures):
@@ -381,7 +380,7 @@ def main():
                 print(f"Task {i+1}/{len(tasks)} completed")
             except Exception as e:
                 print(f"Task {i+1} failed: {e}")
-    
+
     end_time = time.time()
     duration = end_time - start_time
     
