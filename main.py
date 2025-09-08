@@ -2,19 +2,24 @@ import asyncio
 import csv
 import json
 import threading
-from concurrent.futures import ProcessPoolExecutor
+import random
+import signal
+import sys
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from playwright.async_api import async_playwright
 import time
 from datetime import datetime
 import os
+from asyncio import Semaphore
+import logging
 
-# Configuration - Updated for Video Conferencing and IT Hardware Channel Partners
+# Enhanced Configuration
 QUERIES = [
     "Video Conferencing Resellers",
     "Video Conferencing Distributors", 
     "VC Distributors",
     "Conferencing Solutions Resellers",
-    "IT System Integrators",  # Updated from "System Integrators"
+    "IT System Integrators",
     "Video Conferencing Systems Distributors",
     "IT Hardware Distributors",
     "Technology Resellers",
@@ -22,12 +27,83 @@ QUERIES = [
     "Logitech Video Conferencing Distributors",
     "Logitech VC Systems Distributors",
 ]
-MAX_WORKERS = 30  # Increased to 500
-OUTPUT_CSV = "vc_channel_partners_detailed.csv"
-OUTPUT_JSON = "vc_channel_partners_detailed.json"
 
-# Thread-safe file writing
+# Optimized settings for high concurrency
+MAX_WORKERS = 500  # Reduced from 500 to prevent resource exhaustion
+MAX_BROWSER_INSTANCES = 250  # Maximum concurrent browser instances
+OUTPUT_CSV = "vc_partner_new.csv"
+OUTPUT_JSON = "vc_partner_new.json"
+
+# Thread-safe file writing and browser management
 file_lock = threading.Lock()
+browser_semaphore = None  # Will be initialized in main()
+failed_tasks = []
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class BrowserPool:
+    """Manages a pool of browser instances to prevent resource exhaustion"""
+    def __init__(self, max_browsers=10):
+        self.max_browsers = max_browsers
+        self.browsers = []
+        self.available_browsers = asyncio.Queue()
+        self.semaphore = asyncio.Semaphore(max_browsers)
+        self._initialized = False
+    
+    async def initialize(self):
+        """Initialize browser pool"""
+        if self._initialized:
+            return
+        
+        playwright = await async_playwright().start()
+        for i in range(self.max_browsers):
+            try:
+                browser = await playwright.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-features=TranslateUI',
+                        '--disable-extensions',
+                        '--disable-default-apps',
+                        '--disable-sync',
+                        '--memory-pressure-off',
+                        '--max_old_space_size=4096',
+                    ]
+                )
+                await self.available_browsers.put(browser)
+                self.browsers.append(browser)
+                logger.info(f"Initialized browser {i+1}/{self.max_browsers}")
+            except Exception as e:
+                logger.error(f"Failed to initialize browser {i+1}: {e}")
+        
+        self._initialized = True
+    
+    async def get_browser(self):
+        """Get an available browser from the pool"""
+        await self.semaphore.acquire()
+        return await self.available_browsers.get()
+    
+    async def return_browser(self, browser):
+        """Return browser to the pool"""
+        await self.available_browsers.put(browser)
+        self.semaphore.release()
+    
+    async def close_all(self):
+        """Close all browsers in the pool"""
+        for browser in self.browsers:
+            try:
+                await browser.close()
+            except:
+                pass
+
+# Global browser pool
+browser_pool = BrowserPool(MAX_BROWSER_INSTANCES)
 
 def read_pincodes_from_csv(filename="pincode.csv"):
     """Read pincodes from CSV file"""
@@ -38,38 +114,13 @@ def read_pincodes_from_csv(filename="pincode.csv"):
             for row in reader:
                 if 'pincode' in row and row['pincode'].strip():
                     pincodes.append(row['pincode'].strip())
-        print(f"Loaded {len(pincodes)} pincodes from {filename}")
+        logger.info(f"Loaded {len(pincodes)} pincodes from {filename}")
         return pincodes
     except FileNotFoundError:
-        print(f"Error: {filename} not found!")
+        logger.error(f"Error: {filename} not found!")
         return []
     except Exception as e:
-        print(f"Error reading pincodes: {e}")
-        return []
-
-def read_cities_from_csv(filename="city_list.csv"):
-    """Read cities from CSV file"""
-    cities = []
-    try:
-        with open(filename, 'r', encoding='utf-8') as file:
-            reader = csv.DictReader(file)
-            for row in reader:
-                # Try different possible column names for city
-                city_value = None
-                for col in ['city', 'City', 'CITY', 'city_name', 'City_Name']:
-                    if col in row and row[col].strip():
-                        city_value = row[col].strip()
-                        break
-                
-                if city_value:
-                    cities.append(city_value)
-        print(f"Loaded {len(cities)} cities from {filename}")
-        return cities
-    except FileNotFoundError:
-        print(f"Error: {filename} not found!")
-        return []
-    except Exception as e:
-        print(f"Error reading cities: {e}")
+        logger.error(f"Error reading pincodes: {e}")
         return []
 
 def append_to_csv(data, filename=OUTPUT_CSV):
@@ -78,13 +129,11 @@ def append_to_csv(data, filename=OUTPUT_CSV):
         return
     
     with file_lock:
-        # Check if file exists to write header
         file_exists = os.path.exists(filename)
         
         with open(filename, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             
-            # Write header if file is new - Updated headers for channel partners
             if not file_exists:
                 writer.writerow([
                     "Company_Name", "Address", "Rating", "Phone", "Hours", 
@@ -92,7 +141,6 @@ def append_to_csv(data, filename=OUTPUT_CSV):
                     "Search_Query", "Partner_Type", "Services_Offered", "Timestamp"
                 ])
             
-            # Write data rows
             for row in data:
                 writer.writerow(row)
 
@@ -104,7 +152,6 @@ def append_to_json(data, filename=OUTPUT_JSON):
     with file_lock:
         existing_data = []
         
-        # Read existing data if file exists
         if os.path.exists(filename):
             try:
                 with open(filename, 'r', encoding='utf-8') as f:
@@ -112,7 +159,6 @@ def append_to_json(data, filename=OUTPUT_JSON):
             except (json.JSONDecodeError, FileNotFoundError):
                 existing_data = []
         
-        # Convert data rows to dictionaries - Updated headers
         headers = [
             "Company_Name", "Address", "Rating", "Phone", "Hours", 
             "Business_Category", "Website", "Location", "Location_Type", 
@@ -125,10 +171,8 @@ def append_to_json(data, filename=OUTPUT_JSON):
                 record[header] = row[i] if i < len(row) else ""
             new_records.append(record)
         
-        # Append new data
         existing_data.extend(new_records)
         
-        # Write back to file
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(existing_data, f, indent=2, ensure_ascii=False)
 
@@ -173,308 +217,395 @@ def extract_services_offered(category, name, address):
     
     return "; ".join(services) if services else "IT/Technology Solutions"
 
-async def scrape_location_query(location, location_type, query, worker_id):
-    """Scrape Google Maps for Video Conferencing and IT Hardware channel partners"""
+async def scrape_location_query_with_retry(location, location_type, query, worker_id, max_retries=3):
+    """Scrape with retry mechanism and better error handling"""
+    
+    for attempt in range(max_retries):
+        try:
+            # Add random delay to prevent overwhelming
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+            
+            browser = await browser_pool.get_browser()
+            
+            try:
+                result = await scrape_with_browser(browser, location, location_type, query, worker_id, attempt)
+                await browser_pool.return_browser(browser)
+                return result
+            except Exception as e:
+                await browser_pool.return_browser(browser)
+                if attempt == max_retries - 1:
+                    logger.error(f"[Worker {worker_id}] Final attempt failed for {query} in {location}: {e}")
+                    failed_tasks.append((location, location_type, query, worker_id))
+                    return []
+                else:
+                    logger.warning(f"[Worker {worker_id}] Attempt {attempt + 1} failed for {query} in {location}: {e}")
+                    await asyncio.sleep(random.uniform(2, 5))
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"[Worker {worker_id}] Critical error on attempt {attempt + 1}: {e}")
+            if attempt == max_retries - 1:
+                return []
+            await asyncio.sleep(random.uniform(3, 7))
+    
+    return []
+
+async def scrape_with_browser(browser, location, location_type, query, worker_id, attempt):
+    """Actual scraping logic using provided browser"""
     if location_type == "Pincode":
         search_query = f"{query}+{location}+india"
-    else:  # City
+    else:
         search_query = f"{query}+{location}+india"
     
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    print(f"[Worker {worker_id}] Starting: {query} in {location} ({location_type})")
+    logger.info(f"[Worker {worker_id}] Attempt {attempt + 1}: {query} in {location} ({location_type})")
     
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context()
-            page = await context.new_page()
-            
-            # Set timeout and disable images
-            page.set_default_timeout(30000)
-            await context.route("/*.{png,jpg,jpeg,gif,svg,ico,webp}", lambda route: route.abort())
-
-            # Navigate to Google Maps search
-            search_url = f"https://www.google.com/maps/search/{search_query}/"
-            print(f"[Worker {worker_id}] Navigating to: {search_url}")
-            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-            
+        context = await browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        )
+        page = await context.new_page()
+        
+        # Enhanced page settings
+        page.set_default_timeout(45000)  # Increased timeout
+        await page.set_extra_http_headers({
+            'Accept-Language': 'en-US,en;q=0.9',
+        })
+        
+        # Block unnecessary resources
+        await context.route("**/*.{png,jpg,jpeg,gif,svg,ico,webp,css,font,woff,woff2}", lambda route: route.abort())
+        
+        # Navigate with better error handling
+        search_url = f"https://www.google.com/maps/search/{search_query}/"
+        
+        try:
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            logger.warning(f"[Worker {worker_id}] Navigation timeout, trying alternative approach: {e}")
+            await page.goto("https://www.google.com/maps", wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+            search_box = await page.query_selector('input[id="searchboxinput"]')
+            if search_box:
+                await search_box.fill(search_query.replace('+', ' '))
+                await page.keyboard.press('Enter')
             await page.wait_for_timeout(5000)
-            
-            # Wait for results
+        
+        # Wait for results with multiple selectors
+        result_loaded = False
+        selectors_to_try = ['.Nv2PK', '[data-value="Search results"]', '.section-result', '[role="main"]']
+        
+        for selector in selectors_to_try:
             try:
-                await page.wait_for_selector('.Nv2PK', timeout=20000)
+                await page.wait_for_selector(selector, timeout=15000)
+                result_loaded = True
+                break
             except:
-                print(f"[Worker {worker_id}] No results found for {query} in {location} ({location_type})")
-                await browser.close()
-                return []
+                continue
+        
+        if not result_loaded:
+            logger.warning(f"[Worker {worker_id}] No results found for {query} in {location}")
+            await context.close()
+            return []
 
-            # Scroll to load results
-            scroll_attempts = 0
-            max_scrolls = 20  # Increased for business listings
-            prev_count = 0
+        # Enhanced scrolling logic
+        scroll_attempts = 0
+        max_scrolls = 15
+        prev_count = 0
+        stable_count = 0
+        
+        while scroll_attempts < max_scrolls:
+            # Multiple scroll strategies
+            await page.evaluate('''
+                const scrollableElements = [
+                    document.querySelector('[role="feed"]'),
+                    document.querySelector('[role="main"]'),
+                    document.querySelector('.m6QErb'),
+                    document.body
+                ];
+                
+                scrollableElements.forEach(element => {
+                    if (element) {
+                        element.scrollTop = element.scrollHeight;
+                    }
+                });
+                
+                window.scrollTo(0, document.body.scrollHeight);
+            ''')
             
-            while scroll_attempts < max_scrolls:
-                await page.evaluate('''
-                    const feed = document.querySelector('[role="feed"]');
-                    if (feed) feed.scrollTop = feed.scrollHeight;
-                    
-                    const main = document.querySelector('[role="main"]');
-                    if (main) main.scrollTop = main.scrollHeight;
-                    
-                    window.scrollTo(0, document.body.scrollHeight);
-                ''')
-                
-                await page.wait_for_timeout(3000)  # Increased wait time
-                
-                current_results = await page.locator('.Nv2PK').count()
-                
-                if current_results == prev_count and scroll_attempts > 8:
+            await page.wait_for_timeout(random.randint(2000, 4000))
+            
+            current_results = await page.locator('.Nv2PK').count()
+            
+            if current_results == prev_count:
+                stable_count += 1
+                if stable_count >= 3:  # Stop if count is stable for 3 attempts
                     break
-                
-                prev_count = current_results
-                scroll_attempts += 1
-
-            # Extract business data
-            results = []
-            business_containers = await page.locator('.Nv2PK').all()
-            
-            print(f"[Worker {worker_id}] Extracting data from {len(business_containers)} businesses for {query} in {location} ({location_type})")
-            
-            for i, business in enumerate(business_containers):
-                try:
-                    # Extract company name
-                    company_name = ""
-                    try:
-                        name_elem = business.locator('.qBF1Pd.fontHeadlineSmall')
-                        if await name_elem.count() > 0:
-                            company_name = await name_elem.inner_text()
-                    except:
-                        pass
-                    
-                    # Extract rating
-                    rating = ""
-                    try:
-                        rating_elem = business.locator('span[role="img"]')
-                        if await rating_elem.count() > 0:
-                            rating = await rating_elem.get_attribute('aria-label')
-                    except:
-                        pass
-                    
-                    # Extract business category
-                    category = ""
-                    try:
-                        category_elem = business.locator('.W4Efsd span').first
-                        if await category_elem.count() > 0:
-                            category = await category_elem.inner_text()
-                    except:
-                        pass
-                    
-                    # Extract address - Enhanced for business addresses
-                    address = ""
-                    try:
-                        address_divs = await business.locator('.W4Efsd').all()
-                        for div in address_divs:
-                            div_text = await div.inner_text()
-                            div_text = div_text.replace('â‹…', '·').replace('â€¯', ' ').strip()
-                            
-                            # Look for business address indicators
-                            if any(word in div_text for word in [
-                                'Road', 'Complex', 'Street', 'Nagar', 'Colony', 'Office', 
-                                'Building', 'Floor', 'Block', 'Sector', 'Phase', 'Industrial'
-                            ]):
-                                lines = div_text.split('·')
-                                for line in lines:
-                                    line = line.strip()
-                                    if any(word in line.lower() for word in ['open', 'closed', 'closes', 'pm', 'am']):
-                                        continue
-                                    if any(word in line for word in [
-                                        'Road', 'Complex', 'Street', 'Nagar', 'Colony', 
-                                        'Office', 'Building', 'Floor', 'Block', 'Sector'
-                                    ]) and len(line) > 10:
-                                        address = line
-                                        break
-                                if address:
-                                    break
-                    except:
-                        pass
-                    
-                    # Extract phone
-                    phone = ""
-                    try:
-                        phone_elem = business.locator('.UsdlK')
-                        if await phone_elem.count() > 0:
-                            phone = await phone_elem.inner_text()
-                    except:
-                        pass
-                    
-                    # Extract hours
-                    hours = ""
-                    try:
-                        hours_divs = await business.locator('.W4Efsd').all()
-                        for div in hours_divs:
-                            div_text = await div.inner_text()
-                            div_text = div_text.replace('â‹…', '·').replace('â€¯', ' ').strip()
-                            
-                            if any(word in div_text for word in ['Open', 'Closed', 'Closes', 'pm', 'am']):
-                                lines = div_text.split('·')
-                                for line in lines:
-                                    line = line.strip()
-                                    if any(word in line for word in ['Open', 'Closed', 'Closes', 'pm', 'am']):
-                                        hours = line
-                                        break
-                                if hours:
-                                    break
-                    except:
-                        pass
-                    
-                    # Extract website
-                    website = ""
-                    try:
-                        link_elem = business.locator('a.hfpxzc')
-                        if await link_elem.count() > 0:
-                            href = await link_elem.get_attribute('href')
-                            if href and 'google.com/maps' in href:
-                                website = href
-                    except:
-                        pass
-
-                    # Classify partner type and services
-                    partner_type = classify_partner_type(query, category, company_name)
-                    services_offered = extract_services_offered(category, company_name, address)
-
-                    # Add to results if we have at least a company name and it's relevant
-                    if company_name and company_name.strip() and len(company_name.strip()) > 2:
-                        # Filter out irrelevant results
-                        exclude_keywords = [
-                            'restaurant', 'food', 'hotel', 'hospital', 'medical', 
-                            'clinic', 'pharmacy', 'bank', 'atm', 'petrol', 'gas station'
-                        ]
-                        
-                        combined_check = f"{company_name} {category}".lower()
-                        if not any(exclude in combined_check for exclude in exclude_keywords):
-                            results.append([
-                                company_name.strip(),
-                                address.strip(),
-                                rating.strip(),
-                                phone.strip(),
-                                hours.strip(),
-                                category.strip(),
-                                website.strip(),
-                                location,
-                                location_type,
-                                query,
-                                partner_type,
-                                services_offered,
-                                timestamp
-                            ])
-                
-                except Exception as e:
-                    print(f"[Worker {worker_id}] Error extracting business {i}: {e}")
-                    continue
-
-            await browser.close()
-            
-            # Save results immediately
-            if results:
-                append_to_csv(results)
-                append_to_json(results)
-                print(f"[Worker {worker_id}] Completed: {len(results)} channel partners found for {query} in {location} ({location_type})")
             else:
-                print(f"[Worker {worker_id}] No results for {query} in {location} ({location_type})")
+                stable_count = 0
             
-            return results
+            prev_count = current_results
+            scroll_attempts += 1
+
+        # Extract business data with enhanced selectors
+        results = []
+        business_containers = await page.locator('.Nv2PK').all()
+        
+        logger.info(f"[Worker {worker_id}] Extracting data from {len(business_containers)} businesses")
+        
+        for i, business in enumerate(business_containers):
+            try:
+                # Enhanced data extraction with multiple fallback selectors
+                company_name = await extract_text_with_fallbacks(business, [
+                    '.qBF1Pd.fontHeadlineSmall',
+                    '.qBF1Pd',
+                    '[data-value="Name"]',
+                    '.section-result-title'
+                ])
+                
+                rating = await extract_attribute_with_fallbacks(business, 'aria-label', [
+                    'span[role="img"]',
+                    '.MW4etd'
+                ])
+                
+                category = await extract_text_with_fallbacks(business, [
+                    '.W4Efsd span:first-child',
+                    '.W4Efsd:first-child span',
+                    '.section-result-details span'
+                ])
+                
+                # Enhanced address extraction
+                address = await extract_address(business)
+                
+                phone = await extract_text_with_fallbacks(business, [
+                    '.UsdlK',
+                    '[data-value="Phone number"]'
+                ])
+                
+                hours = await extract_hours(business)
+                
+                website = await extract_attribute_with_fallbacks(business, 'href', [
+                    'a.hfpxzc',
+                    'a[data-value="Website"]'
+                ])
+
+                partner_type = classify_partner_type(query, category, company_name)
+                services_offered = extract_services_offered(category, company_name, address)
+
+                if company_name and len(company_name.strip()) > 2:
+                    # Enhanced filtering
+                    if is_relevant_business(company_name, category):
+                        results.append([
+                            company_name.strip(),
+                            address.strip(),
+                            rating.strip(),
+                            phone.strip(),
+                            hours.strip(),
+                            category.strip(),
+                            website.strip(),
+                            location,
+                            location_type,
+                            query,
+                            partner_type,
+                            services_offered,
+                            timestamp
+                        ])
+            
+            except Exception as e:
+                logger.warning(f"[Worker {worker_id}] Error extracting business {i}: {e}")
+                continue
+
+        await context.close()
+        
+        # Save results immediately
+        if results:
+            append_to_csv(results)
+            append_to_json(results)
+            logger.info(f"[Worker {worker_id}] Success: {len(results)} partners found for {query} in {location}")
+        
+        return results
 
     except Exception as e:
-        print(f"[Worker {worker_id}] Error scraping {query} in {location} ({location_type}): {e}")
-        return []
+        logger.error(f"[Worker {worker_id}] Scraping error: {e}")
+        raise e
 
-def run_scraping_task(location, location_type, query, worker_id):
-    """Wrapper to run async scraping in process"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+async def extract_text_with_fallbacks(element, selectors):
+    """Extract text using multiple fallback selectors"""
+    for selector in selectors:
+        try:
+            locator = element.locator(selector)
+            if await locator.count() > 0:
+                return await locator.inner_text()
+        except:
+            continue
+    return ""
+
+async def extract_attribute_with_fallbacks(element, attribute, selectors):
+    """Extract attribute using multiple fallback selectors"""
+    for selector in selectors:
+        try:
+            locator = element.locator(selector)
+            if await locator.count() > 0:
+                return await locator.get_attribute(attribute) or ""
+        except:
+            continue
+    return ""
+
+async def extract_address(business):
+    """Enhanced address extraction"""
+    address = ""
     try:
-        return loop.run_until_complete(scrape_location_query(location, location_type, query, worker_id))
+        address_divs = await business.locator('.W4Efsd').all()
+        for div in address_divs:
+            div_text = await div.inner_text()
+            div_text = div_text.replace('â‹…', '·').replace('â€¯', ' ').strip()
+            
+            if any(word in div_text for word in [
+                'Road', 'Complex', 'Street', 'Nagar', 'Colony', 'Office', 
+                'Building', 'Floor', 'Block', 'Sector', 'Phase', 'Industrial'
+            ]):
+                lines = div_text.split('·')
+                for line in lines:
+                    line = line.strip()
+                    if any(word in line.lower() for word in ['open', 'closed', 'closes', 'pm', 'am']):
+                        continue
+                    if any(word in line for word in [
+                        'Road', 'Complex', 'Street', 'Nagar', 'Colony', 
+                        'Office', 'Building', 'Floor', 'Block', 'Sector'
+                    ]) and len(line) > 10:
+                        address = line
+                        break
+                if address:
+                    break
+    except:
+        pass
+    return address
+
+async def extract_hours(business):
+    """Enhanced hours extraction"""
+    hours = ""
+    try:
+        hours_divs = await business.locator('.W4Efsd').all()
+        for div in hours_divs:
+            div_text = await div.inner_text()
+            div_text = div_text.replace('â‹…', '·').replace('â€¯', ' ').strip()
+            
+            if any(word in div_text for word in ['Open', 'Closed', 'Closes', 'pm', 'am']):
+                lines = div_text.split('·')
+                for line in lines:
+                    line = line.strip()
+                    if any(word in line for word in ['Open', 'Closed', 'Closes', 'pm', 'am']):
+                        hours = line
+                        break
+                if hours:
+                    break
+    except:
+        pass
+    return hours
+
+def is_relevant_business(company_name, category):
+    """Enhanced relevance filtering"""
+    exclude_keywords = [
+        'restaurant', 'food', 'hotel', 'hospital', 'medical', 
+        'clinic', 'pharmacy', 'bank', 'atm', 'petrol', 'gas station',
+        'school', 'college', 'temple', 'church', 'mosque'
+    ]
+    
+    combined_check = f"{company_name} {category}".lower()
+    return not any(exclude in combined_check for exclude in exclude_keywords)
+
+async def process_tasks_async(tasks):
+    """Process all tasks asynchronously"""
+    await browser_pool.initialize()
+    
+    semaphore = asyncio.Semaphore(MAX_WORKERS)
+    
+    async def bounded_task(task):
+        async with semaphore:
+            location, location_type, query, worker_id = task
+            return await scrape_location_query_with_retry(location, location_type, query, worker_id)
+    
+    # Process all tasks
+    results = await asyncio.gather(*[bounded_task(task) for task in tasks], return_exceptions=True)
+    
+    await browser_pool.close_all()
+    
+    return results
+
+def run_async_scraping(tasks):
+    """Run the async scraping process"""
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(process_tasks_async(tasks))
     finally:
         loop.close()
 
 def main():
-    """Main function to orchestrate multiprocess scraping for Video Conferencing Channel Partners"""
-    print("Starting Video Conferencing & IT Hardware Channel Partners scraper...")
-    print(f"Configuration: {MAX_WORKERS} workers, {len(QUERIES)} search queries")
-    print("Target: Video Conferencing Resellers, Distributors, and System Integrators")
+    """Main function with improved error handling and resource management"""
+    logger.info("Starting Enhanced Video Conferencing & IT Hardware Channel Partners scraper...")
+    logger.info(f"Configuration: {MAX_WORKERS} workers, {MAX_BROWSER_INSTANCES} browser instances")
     
-    # Read pincodes and cities
+    # Setup signal handlers for graceful shutdown
+    def signal_handler(signum, frame):
+        logger.info("Received interrupt signal. Shutting down gracefully...")
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Read pincodes
     pincodes = read_pincodes_from_csv()
     
     if not pincodes:
-        print("No pincodes or cities found. Exiting...")
+        logger.error("No pincodes found. Exiting...")
         return
     
-    # Create tasks for all combinations of locations and queries
+    # Create tasks
     tasks = []
+    for i, pincode in enumerate(pincodes):
+        for j, query in enumerate(QUERIES):
+            worker_id = (i * len(QUERIES) + j) + 1
+            tasks.append((pincode, "Pincode", query, worker_id))
     
-    # Add pincode tasks
-    for pincode in pincodes:
-        for query in QUERIES:
-            tasks.append((pincode, "Pincode", query))
-    
-
-    
-    # print(f"Total tasks to process: {len(tasks)} ({len(pincodes)} pincodes, {len(cities)} cities)")
-    print(f"Estimated completion time: {len(tasks) * 2 / MAX_WORKERS:.1f} minutes")
+    logger.info(f"Total tasks to process: {len(tasks)}")
+    logger.info(f"Estimated completion time: {len(tasks) * 1.5 / MAX_WORKERS:.1f} minutes")
     
     # Clear output files
-    if os.path.exists(OUTPUT_CSV):
-        os.remove(OUTPUT_CSV)
-    if os.path.exists(OUTPUT_JSON):
-        os.remove(OUTPUT_JSON)
+    for file in [OUTPUT_CSV, OUTPUT_JSON]:
+        if os.path.exists(file):
+            os.remove(file)
     
     start_time = time.time()
-    total_results = 0
     
-    # Process tasks with process pool
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
+    try:
+        # Run scraping
+        results = run_async_scraping(tasks)
         
-        for i, (location, location_type, query) in enumerate(tasks):
-            worker_id = (i % MAX_WORKERS) + 1
-            future = executor.submit(run_scraping_task, location, location_type, query, worker_id)
-            futures.append(future)
+        # Count successful results
+        total_results = sum(len(r) for r in results if isinstance(r, list))
         
-        # Wait for all tasks to complete
-        completed = 0
-        for i, future in enumerate(futures):
-            try:
-                results = future.result(timeout=300)  # 5 minute timeout per task
-                total_results += len(results)
-                completed += 1
-                if completed % 50 == 0:  # Progress update every 50 tasks
-                    print(f"Progress: {completed}/{len(tasks)} tasks completed ({completed/len(tasks)*100:.1f}%)")
-            except Exception as e:
-                print(f"Task {i+1} failed: {e}")
-                completed += 1
-
-    end_time = time.time()
-    duration = end_time - start_time
+        end_time = time.time()
+        duration = end_time - start_time
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Enhanced Scraping Completed!")
+        logger.info(f"Total channel partners found: {total_results}")
+        logger.info(f"Total execution time: {duration:.2f} seconds ({duration/60:.1f} minutes)")
+        logger.info(f"Failed tasks: {len(failed_tasks)}")
+        logger.info(f"Success rate: {((len(tasks) - len(failed_tasks)) / len(tasks) * 100):.1f}%")
+        logger.info(f"Results saved to: {OUTPUT_CSV} and {OUTPUT_JSON}")
+        logger.info(f"{'='*60}")
+        
+        if failed_tasks:
+            logger.info(f"\nFailed tasks summary:")
+            for task in failed_tasks[:10]:  # Show first 10 failed tasks
+                logger.info(f"  - {task[2]} in {task[0]} ({task[1]})")
     
-    print(f"\n{'='*60}")
-    print(f"Video Conferencing Channel Partners Scraping Completed!")
-    print(f"Total channel partners found: {total_results}")
-    print(f"Total execution time: {duration:.2f} seconds ({duration/60:.1f} minutes)")
-    print(f"Average results per minute: {total_results/(duration/60):.1f}")
-    print(f"Results saved to:")
-    print(f"  - CSV: {OUTPUT_CSV}")
-    print(f"  - JSON: {OUTPUT_JSON}")
-    print(f"{'='*60}")
-    
-    # Print feasibility summary
-    print(f"\nFEASIBILITY SUMMARY:")
-    print(f"- Target Keywords: {len(QUERIES)} search terms")
-    print(f"- Geographic Coverage: {len(pincodes)} pincodes + {len(cities)} cities")
-    print(f"- Total Search Combinations: {len(tasks)}")
-    print(f"- Estimated Timeline: {duration/3600:.1f} hours for full execution")
-    print(f"- Data Quality: Structured with partner classification and services mapping")
+    except Exception as e:
+        logger.error(f"Fatal error in main process: {e}")
+        return
 
 if __name__ == "__main__":
     main()
