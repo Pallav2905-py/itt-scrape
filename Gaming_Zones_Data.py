@@ -9,40 +9,18 @@ from datetime import datetime
 import os
 import re
 
-# Configuration - Updated for Medical and Pharma Colleges
-QUERIES = [
-    "medical colleges", 
-    "pharmacy colleges", 
-    "medical universities",
-    "pharmaceutical universities",
-    "medical schools"
-]
+# Configuration - Updated for Gaming Zones
+QUERIES = ["gaming zones", "game arcades", "VR gaming centers"]
 MAX_WORKERS = 5
-OUTPUT_CSV = "medical_pharma_colleges.csv"
-OUTPUT_JSON = "medical_pharma_colleges.json"
-
-# Target designations to look for
-TARGET_DESIGNATIONS = [
-    "Director", "Dean", "Head of Department", "HOD", "Vice Chancellor", 
-    "President", "Principal", "Registrar", "Chairman", "Head of Anatomy",
-    "Department Head", "Academic Director"
-]
-
-# Countries to process
-COUNTRIES = ["Europe", "USA", "Canada", "India", "Middle East"]
+OUTPUT_CSV = "gaming_zones_usa_canada.csv"
+OUTPUT_JSON = "gaming_zones_usa_canada.json"
 
 # Thread-safe file writing
 file_lock = threading.Lock()
 
-def read_pincodes_from_csv(country):
-    """Read pincodes from country-specific CSV file"""
-    filename = f"pincode_{country}.csv"
+def read_pincodes_from_csv(filename="pincode.csv"):
+    """Read pincodes from CSV file"""
     pincodes = []
-    
-    if not os.path.exists(filename):
-        print(f"Warning: {filename} not found! Skipping {country}")
-        return []
-    
     try:
         with open(filename, 'r', encoding='utf-8') as file:
             reader = csv.DictReader(file)
@@ -55,7 +33,7 @@ def read_pincodes_from_csv(country):
         print(f"Error: {filename} not found!")
         return []
     except Exception as e:
-        print(f"Error reading pincodes from {filename}: {e}")
+        print(f"Error reading pincodes: {e}")
         return []
 
 def read_cities_from_csv(filename="city_list.csv"):
@@ -98,10 +76,10 @@ def append_to_csv(data, filename=OUTPUT_CSV):
             # Write header if file is new
             if not file_exists:
                 writer.writerow([
-                    "Institute_University_Name", "Contact_Person_Name", "Designation", 
-                    "Contact_Number", "Email_Address", "City", "State", "Postal_Code", 
-                    "Full_Address", "Website", "Rating", "Review_Count", "Category", 
-                    "Google_Maps_URL", "Country", "Query", "Timestamp"
+                    "Business_Name", "Contact_Person", "Phone", "Email", "Website",
+                    "City", "State", "Postal_Code", "Full_Address", "Rating", 
+                    "Review_Count", "Category", "Hours", "Plus_Code", "Located_In",
+                    "Price_Level", "Amenities", "Google_Maps_URL", "Query", "Timestamp"
                 ])            
             # Write data rows
             for row in data:
@@ -125,10 +103,10 @@ def append_to_json(data, filename=OUTPUT_JSON):
         
         # Convert data rows to dictionaries
         headers = [
-            "Institute_University_Name", "Contact_Person_Name", "Designation", 
-            "Contact_Number", "Email_Address", "City", "State", "Postal_Code", 
-            "Full_Address", "Website", "Rating", "Review_Count", "Category", 
-            "Google_Maps_URL", "Country", "Query", "Timestamp"
+            "Business_Name", "Contact_Person", "Phone", "Email", "Website",
+            "City", "State", "Postal_Code", "Full_Address", "Rating", 
+            "Review_Count", "Category", "Hours", "Plus_Code", "Located_In",
+            "Price_Level", "Amenities", "Google_Maps_URL", "Query", "Timestamp"
         ]
         new_records = []
         for row in data:
@@ -146,13 +124,10 @@ def append_to_json(data, filename=OUTPUT_JSON):
 
 def extract_contact_info(text):
     """Extract phone numbers and emails from text"""
-    # International phone patterns
+    # US/Canada phone patterns
     phone_patterns = [
-        r'\+?(\d{1,4})[-.\s]?\(?(\d{1,4})\)?[-.\s]?(\d{1,4})[-.\s]?(\d{1,4})[-.\s]?(\d{0,4})',
-        r'\+?1[-.\s]?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})',  # North America
-        r'\+?44[-.\s]?\(?([0-9]{3,4})\)?[-.\s]?([0-9]{3,4})[-.\s]?([0-9]{3,4})',  # UK
-        r'\+?91[-.\s]?\(?([0-9]{3,4})\)?[-.\s]?([0-9]{3,4})[-.\s]?([0-9]{3,4})',  # India
-        r'\(?([0-9]{3,4})\)?[-.\s]?([0-9]{3,4})[-.\s]?([0-9]{3,4})'  # General
+        r'\+?1[-.\s]?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})',
+        r'\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})'
     ]
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     
@@ -160,10 +135,9 @@ def extract_contact_info(text):
     for pattern in phone_patterns:
         match = re.search(pattern, text)
         if match:
-            groups = match.groups()
-            if len(groups) >= 2:
-                phone_number = "-".join([g for g in groups if g])
-                break
+            if len(match.groups()) == 3:
+                phone_number = f"+1 {match.group(1)}-{match.group(2)}-{match.group(3)}"
+            break
     
     emails = re.findall(email_pattern, text)
     email = emails[0] if emails else ""
@@ -176,13 +150,10 @@ def parse_address(address_text):
     state = ""
     postal_code = ""
     
-    # Extract postal code (various international formats)
+    # Extract postal code (US: 5 digits or ZIP+4, Canada: A1A 1A1 format)
     postal_patterns = [
         r'\b(\d{5}(?:-\d{4})?)\b',  # US ZIP
-        r'\b([A-Z]\d[A-Z]\s?\d[A-Z]\d)\b',  # Canada postal code
-        r'\b([A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})\b',  # UK postcode
-        r'\b(\d{6})\b',  # India pincode
-        r'\b(\d{5})\b',  # General 5-digit
+        r'\b([A-Z]\d[A-Z]\s?\d[A-Z]\d)\b'  # Canada postal code
     ]
     
     for pattern in postal_patterns:
@@ -191,63 +162,24 @@ def parse_address(address_text):
             postal_code = match.group(1).upper()
             break
     
-    # Extract state/province/region
-    state_patterns = [
-        rf'\b([A-Z]{{2,3}})\s+{re.escape(postal_code)}' if postal_code else r'',
-        r',\s*([A-Z]{2,20})\s*\d{5,6}',  # State before postal code
-        r',\s*([A-Za-z\s]{2,20})(?:,|\s*$)'  # Last component before country
-    ]
+    # Extract state/province (2-3 letter abbreviation before postal code)
+    if postal_code:
+        state_pattern = rf'\b([A-Z]{{2,3}})\s+{re.escape(postal_code)}'
+        match = re.search(state_pattern, address_text, re.IGNORECASE)
+        if match:
+            state = match.group(1).upper()
     
-    for pattern in state_patterns:
-        if pattern:
-            match = re.search(pattern, address_text, re.IGNORECASE)
-            if match:
-                state = match.group(1).strip().title()
-                break
-    
-    # Extract city
-    city_patterns = [
-        rf'([^,\n]+),\s*{re.escape(state)}' if state else r'',
-        r'^([^,\n]+),',  # First component
-        r',\s*([^,\n]+),\s*[A-Z]{2,20}'  # Middle component
-    ]
-    
-    for pattern in city_patterns:
-        if pattern:
-            match = re.search(pattern, address_text, re.IGNORECASE)
-            if match:
-                city = match.group(1).strip().title()
-                break
+    # Extract city (text before state)
+    if state:
+        city_pattern = rf'([^,\n]+),\s*{re.escape(state)}'
+        match = re.search(city_pattern, address_text, re.IGNORECASE)
+        if match:
+            city = match.group(1).strip()
     
     return city, state, postal_code
 
-def extract_designation_and_contact(text):
-    """Extract designation and contact person from text"""
-    designation = ""
-    contact_person = ""
-    
-    # Look for designation patterns
-    for target_designation in TARGET_DESIGNATIONS:
-        patterns = [
-            rf'{target_designation}[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
-            rf'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)[,\s]+{target_designation}',
-            rf'{target_designation}[:\s]*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)'
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                designation = target_designation
-                contact_person = match.group(1).strip()
-                break
-        
-        if designation:
-            break
-    
-    return designation, contact_person
-
 async def scrape_location_query(pincode, country, query, worker_id):
-    """Scrape Google Maps for medical and pharma colleges"""
+    """Scrape Google Maps for gaming zones"""
     search_query = f"{query} {pincode} {country}"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
@@ -289,7 +221,7 @@ async def scrape_location_query(pincode, country, query, worker_id):
 
             # Get all business listings
             business_containers = await page.locator('.Nv2PK').all()
-            print(f"[Worker {worker_id}] Found {len(business_containers)} institutions")
+            print(f"[Worker {worker_id}] Found {len(business_containers)} businesses")
             
             results = []
             
@@ -302,14 +234,14 @@ async def scrape_location_query(pincode, country, query, worker_id):
                     # Get the current URL after clicking on the business
                     google_maps_url = page.url
                     
-                    # Extract institution name
-                    institution_name = ""
+                    # Extract business name
+                    business_name = ""
                     name_selectors = ['.DUwDvf', '.qBF1Pd.fontHeadlineSmall', 'h1']
                     for selector in name_selectors:
                         try:
                             name_elem = page.locator(selector).first
                             if await name_elem.count() > 0:
-                                institution_name = await name_elem.inner_text()
+                                business_name = await name_elem.inner_text()
                                 break
                         except:
                             continue
@@ -357,6 +289,34 @@ async def scrape_location_query(pincode, country, query, worker_id):
                     # Parse address components
                     city, state, postal_code = parse_address(full_address)
                     
+                    # Extract "Located in" information
+                    located_in = ""
+                    try:
+                        located_elem = page.locator('[data-item-id="locatedin"] .Io6YTe').first
+                        if await located_elem.count() > 0:
+                            located_in = await located_elem.inner_text()
+                            located_in = located_in.replace("Located in: ", "")
+                    except:
+                        pass
+                    
+                    # Extract hours
+                    hours = ""
+                    try:
+                        hours_elem = page.locator('.ZDu9vd').first
+                        if await hours_elem.count() > 0:
+                            hours = await hours_elem.inner_text()
+                    except:
+                        pass
+                    
+                    # Extract Plus Code
+                    plus_code = ""
+                    try:
+                        plus_elem = page.locator('[data-item-id="oloc"] .Io6YTe').first
+                        if await plus_elem.count() > 0:
+                            plus_code = await plus_elem.inner_text()
+                    except:
+                        pass
+                    
                     # Extract website
                     website = ""
                     try:
@@ -383,76 +343,108 @@ async def scrape_location_query(pincode, country, query, worker_id):
                         except:
                             continue
                     
-                    # Extract email and look for designation/contact person
-                    email_address = ""
-                    designation = ""
-                    contact_person_name = ""
-                    
+                    # Extract amenities (wheelchair accessible, etc.)
+                    amenities = []
                     try:
-                        # Get page content to search for emails and designations
-                        page_content = await page.content()
-                        _, email_address = extract_contact_info(page_content)
+                        amenity_elems = page.locator('.wmQCje[data-tooltip]')
+                        count = await amenity_elems.count()
+                        for j in range(count):
+                            amenity = await amenity_elems.nth(j).get_attribute('data-tooltip')
+                            if amenity:
+                                amenities.append(amenity)
+                    except:
+                        pass
+                    amenities_str = "; ".join(amenities) if amenities else ""
+                    
+                    # Extract price level (if available)
+                    price_level = ""
+                    try:
+                        # Look for price indicators like $, $$, $$$, $$$$
+                        price_elem = page.locator('.mgr77e').first
+                        if await price_elem.count() > 0:
+                            price_level = await price_elem.inner_text()
+                    except:
+                        pass
+                    
+                    # Extract email from website or reviews
+                    email_address = ""
+                    try:
+                        # Look for website link first
+                        if website and '@' in website:
+                            _, email_address = extract_contact_info(website)
                         
-                        # Look for designation and contact person in reviews, descriptions, etc.
-                        desc_elem = page.locator('.PYvSYb').first
-                        if await desc_elem.count() > 0:
-                            desc_text = await desc_elem.inner_text()
-                            designation, contact_person_name = extract_designation_and_contact(desc_text)
-                        
-                        # Also check owner responses for contact information
-                        if not contact_person_name or not designation:
-                            owner_responses = page.locator('.CDe7pd .wiI7pd')
-                            if await owner_responses.count() > 0:
-                                response_text = await owner_responses.first.inner_text()
-                                temp_designation, temp_contact = extract_designation_and_contact(response_text)
-                                if not designation:
-                                    designation = temp_designation
-                                if not contact_person_name:
-                                    contact_person_name = temp_contact
-                        
-                        # Look in reviews for staff mentions
-                        if not contact_person_name or not designation:
-                            review_elems = page.locator('.wiI7pd')
-                            count = await review_elems.count()
-                            for j in range(min(3, count)):  # Check first 3 reviews
-                                review_text = await review_elems.nth(j).inner_text()
-                                temp_designation, temp_contact = extract_designation_and_contact(review_text)
-                                if not designation and temp_designation:
-                                    designation = temp_designation
-                                if not contact_person_name and temp_contact:
-                                    contact_person_name = temp_contact
-                                if designation and contact_person_name:
+                        # If no email found, search in reviews and content
+                        if not email_address:
+                            page_content = await page.content()
+                            _, email_address = extract_contact_info(page_content)
+                    except:
+                        pass
+                    
+                    # Extract contact person name from reviews or owner responses
+                    contact_person_name = ""
+                    try:
+                        # Look for owner responses
+                        owner_responses = page.locator('.CDe7pd .wiI7pd')
+                        if await owner_responses.count() > 0:
+                            response_text = await owner_responses.first.inner_text()
+                            # Look for patterns like "Hi, this is John" or "Thank you, - Mike"
+                            name_patterns = [
+                                r'(?:Hi|Hello|Thanks?),?\s+(?:this\s+is\s+)?([A-Z][a-z]+)\b',
+                                r'(?:Sincerely|Best|Regards),?\s+([A-Z][a-z]+)',
+                                r'-\s*([A-Z][a-z]+)\s*$'
+                            ]
+                            for pattern in name_patterns:
+                                match = re.search(pattern, response_text, re.MULTILINE | re.IGNORECASE)
+                                if match:
+                                    contact_person_name = match.group(1)
                                     break
                         
-                    except Exception as e:
-                        print(f"[Worker {worker_id}] Error extracting additional info: {e}")
+                        # Also check business description for owner mentions
+                        if not contact_person_name:
+                            desc_elem = page.locator('.PYvSYb').first
+                            if await desc_elem.count() > 0:
+                                desc_text = await desc_elem.inner_text()
+                                owner_patterns = [
+                                    r'owner\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)',
+                                    r'founded\s+by\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)',
+                                    r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:opened|started|founded)'
+                                ]
+                                for pattern in owner_patterns:
+                                    match = re.search(pattern, desc_text, re.IGNORECASE)
+                                    if match:
+                                        contact_person_name = match.group(1)
+                                        break
+                    except:
                         pass
 
-                    # Only add if we have essential data (institution name)
-                    if institution_name and institution_name.strip():
+                    # Only add if we have essential data
+                    if business_name and business_name.strip():
                         results.append([
-                            institution_name.strip(),
+                            business_name.strip(),
                             contact_person_name.strip(),
-                            designation.strip(),
                             contact_number.strip(),
                             email_address.strip(),
+                            website.strip() if website else "",
                             city.strip(),
                             state.strip(),
                             postal_code.strip(),
                             full_address.strip(),
-                            website.strip() if website else "",
                             rating.strip(),
                             review_count.strip(),
                             category.strip(),
+                            hours.strip(),
+                            plus_code.strip(),
+                            located_in.strip(),
+                            price_level.strip(),
+                            amenities_str.strip(),
                             google_maps_url.strip(),
-                            country,
                             query,
                             timestamp
                         ])
-                        print(f"[Worker {worker_id}] Extracted: {institution_name}")
+                        print(f"[Worker {worker_id}] Extracted: {business_name}")
                 
                 except Exception as e:
-                    print(f"[Worker {worker_id}] Error extracting institution {i}: {e}")
+                    print(f"[Worker {worker_id}] Error extracting business {i}: {e}")
                     continue
 
             await browser.close()
@@ -461,7 +453,7 @@ async def scrape_location_query(pincode, country, query, worker_id):
             if results:
                 append_to_csv(results)
                 append_to_json(results)
-                print(f"[Worker {worker_id}] Completed: {len(results)} institutions found")
+                print(f"[Worker {worker_id}] Completed: {len(results)} gaming zones found")
             else:
                 print(f"[Worker {worker_id}] No results found")
             
@@ -471,39 +463,35 @@ async def scrape_location_query(pincode, country, query, worker_id):
         print(f"[Worker {worker_id}] Error scraping: {e}")
         return []
 
-def run_scraping_task(location, country, query, worker_id):
+def run_scraping_task(location, location_type, query, worker_id):
     """Wrapper to run async scraping in process"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(scrape_location_query(location, country, query, worker_id))
+        return loop.run_until_complete(scrape_location_query(location, location_type, query, worker_id))
     finally:
         loop.close()
 
 def main():
     """Main function to orchestrate scraping"""
-    print("Starting Google Maps scraper for Medical and Pharma Colleges...")
+    print("Starting Google Maps scraper for Gaming Zones in USA/Canada...")
     
-    # Create tasks for all countries and queries
+    # Read pincodes
+    pincodes = read_pincodes_from_csv()
+    
+    if not pincodes:
+        print("No pincodes found. Exiting...")
+        return
+    
+    # Create tasks for both countries
     tasks = []
-    total_pincodes = 0
+    countries = ["USA", "Canada"]
     
-    for country in COUNTRIES:
-        pincodes = read_pincodes_from_csv(country)
-        if not pincodes:
-            continue
-            
-        total_pincodes += len(pincodes)
-        
-        for pincode in pincodes:
+    for pincode in pincodes:
+        for country in countries:
             for query in QUERIES:
                 tasks.append((pincode, country, query))
     
-    if not tasks:
-        print("No pincodes found for any country. Exiting...")
-        return
-    
-    print(f"Total pincodes loaded: {total_pincodes}")
     print(f"Total tasks: {len(tasks)}")
     
     # Clear output files
