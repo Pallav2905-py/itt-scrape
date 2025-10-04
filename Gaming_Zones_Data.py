@@ -8,17 +8,253 @@ import time
 from datetime import datetime
 import os
 import re
+import logging
+from collections import deque
+import signal
+import sys
+import subprocess
+import psutil
+import platform
 
 # Configuration - Updated for Gaming Zones
 QUERIES = ["gaming zones", "game arcades", "VR gaming centers"]
-MAX_WORKERS = 5
-OUTPUT_CSV = "gaming_zones_usa_canada.csv"
-OUTPUT_JSON = "gaming_zones_usa_canada.json"
+MAX_WORKERS = 500
+OUTPUT_CSV = "gaming_zones_usa.csv"
+OUTPUT_JSON = "gaming_zones_usa.json"
+LOG_FILE = "gaming_zones_scraper.log"
+PID_FILE = "gaming_zones_scraper.pid"
+MAX_LOG_LINES = 15
 
-# Thread-safe file writing
+# Thread-safe file writing and logging
 file_lock = threading.Lock()
+log_lock = threading.Lock()
 
-def read_pincodes_from_csv(filename="pincode.csv"):
+class RotatingLogger:
+    def __init__(self, log_file, max_lines=15):
+        self.log_file = log_file
+        self.max_lines = max_lines
+        self.buffer = deque(maxlen=max_lines)
+        
+    def log(self, message):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        
+        with log_lock:
+            self.buffer.append(log_entry)
+            self._write_to_file()
+        
+        # Don't print to console in daemon mode
+        if not getattr(self, 'daemon_mode', False):
+            print(log_entry)
+    
+    def _write_to_file(self):
+        try:
+            with open(self.log_file, 'w', encoding='utf-8') as f:
+                for line in self.buffer:
+                    f.write(line + '\n')
+        except Exception as e:
+            if not getattr(self, 'daemon_mode', False):
+                print(f"Error writing to log file: {e}")
+
+# Global logger instance
+logger = RotatingLogger(LOG_FILE, MAX_LOG_LINES)
+
+def create_pid_file():
+    """Create PID file for daemon management"""
+    try:
+        with open(PID_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        logger.log(f"PID file created: {PID_FILE} with PID: {os.getpid()}")
+    except Exception as e:
+        logger.log(f"Error creating PID file: {e}")
+
+def remove_pid_file():
+    """Remove PID file"""
+    try:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+        logger.log("PID file removed")
+    except Exception as e:
+        logger.log(f"Error removing PID file: {e}")
+
+def is_running():
+    """Check if daemon is already running"""
+    if not os.path.exists(PID_FILE):
+        return False
+    
+    try:
+        with open(PID_FILE, 'r') as f:
+            pid = int(f.read().strip())
+        
+        # Check if process is actually running
+        return psutil.pid_exists(pid)
+    except:
+        return False
+
+def stop_daemon():
+    """Stop the running daemon - Windows compatible"""
+    if not os.path.exists(PID_FILE):
+        print("No PID file found. Daemon may not be running.")
+        return False
+    
+    try:
+        with open(PID_FILE, 'r') as f:
+            pid = int(f.read().strip())
+        
+        if psutil.pid_exists(pid):
+            process = psutil.Process(pid)
+            
+            # Try graceful termination first
+            process.terminate()
+            
+            # Wait for graceful shutdown
+            try:
+                process.wait(timeout=10)
+                print(f"Daemon with PID {pid} stopped successfully")
+            except psutil.TimeoutExpired:
+                # Force kill if graceful shutdown fails
+                process.kill()
+                print(f"Daemon with PID {pid} force killed")
+            
+            remove_pid_file()
+            return True
+        else:
+            print(f"Process with PID {pid} not found. Removing stale PID file.")
+            remove_pid_file()
+            return False
+            
+    except Exception as e:
+        print(f"Error stopping daemon: {e}")
+        return False
+
+def daemonize():
+    """Daemonize the process to run in background - Windows compatible"""
+    system = platform.system().lower()
+    
+    if system == "windows":
+        # Windows doesn't support fork, so we'll use subprocess to detach
+        daemonize_windows()
+    else:
+        # Unix/Linux daemonization
+        daemonize_unix()
+
+def daemonize_windows():
+    """Windows-specific daemonization using subprocess"""
+    try:
+        # Get current script path and arguments
+        script_path = os.path.abspath(__file__)
+        
+        # Use a simpler approach for Windows
+        if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP'):
+            creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            creation_flags = 0x00000200  # CREATE_NEW_PROCESS_GROUP value
+        
+        # Start the service process
+        process = subprocess.Popen([
+            sys.executable, script_path, '--service'
+        ], 
+        creationflags=creation_flags,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        close_fds=True
+        )
+        
+        # Give it a moment to start
+        time.sleep(2)
+        
+        # Check if process is still running
+        if process.poll() is None:
+            print(f"Daemon started successfully with PID: {process.pid}")
+        else:
+            print("Failed to start daemon process")
+            
+        # Parent process exits
+        sys.exit(0)
+        
+    except Exception as e:
+        print(f"Windows daemonization failed: {e}")
+        print("Trying alternative method...")
+        
+        # Alternative method - just run as service directly
+        try:
+            script_path = os.path.abspath(__file__)
+            os.system(f'start /B python "{script_path}" --service')
+            print("Daemon started using alternative method")
+            sys.exit(0)
+        except Exception as e2:
+            print(f"Alternative method also failed: {e2}")
+            sys.exit(1)
+
+def daemonize_unix():
+    """Unix/Linux daemonization using fork"""
+    try:
+        # First fork
+        pid = os.fork()
+        if pid > 0:
+            # Parent process exits
+            print(f"Daemon starting with PID: {pid}")
+            sys.exit(0)
+    except OSError as e:
+        logger.log(f"Fork #1 failed: {e}")
+        sys.exit(1)
+    
+    # Decouple from parent environment
+    os.chdir(os.path.expanduser("~"))  # Use home directory instead of root
+    os.setsid()
+    os.umask(0o022)  # More permissive umask
+    
+    try:
+        # Second fork
+        pid = os.fork()
+        if pid > 0:
+            # Second parent exits
+            sys.exit(0)
+    except OSError as e:
+        logger.log(f"Fork #2 failed: {e}")
+        sys.exit(1)
+    
+    # Redirect standard file descriptors
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
+    # Use /dev/null or NUL depending on platform
+    null_device = '/dev/null' if os.name != 'nt' else 'NUL'
+    
+    try:
+        # Redirect stdin, stdout, stderr
+        with open(null_device, 'r') as f:
+            os.dup2(f.fileno(), sys.stdin.fileno())
+        with open(null_device, 'a+') as f:
+            os.dup2(f.fileno(), sys.stdout.fileno())
+        with open(null_device, 'a+') as f:
+            os.dup2(f.fileno(), sys.stderr.fileno())
+    except Exception as e:
+        # If redirection fails, continue anyway
+        logger.log(f"Warning: Could not redirect file descriptors: {e}")
+    
+    # Set daemon mode flag
+    logger.daemon_mode = True
+    
+    # Create PID file
+    create_pid_file()
+    
+    # Register cleanup on exit
+    import atexit
+    atexit.register(remove_pid_file)
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    logger.log(f"Received signal {signum}. Stopping scraper...")
+    remove_pid_file()
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+def read_pincodes_from_csv(filename="pincode_usa.csv"):
     """Read pincodes from CSV file"""
     pincodes = []
     try:
@@ -27,13 +263,13 @@ def read_pincodes_from_csv(filename="pincode.csv"):
             for row in reader:
                 if 'pincode' in row and row['pincode'].strip():
                     pincodes.append(row['pincode'].strip())
-        print(f"Loaded {len(pincodes)} pincodes from {filename}")
+        logger.log(f"Loaded {len(pincodes)} pincodes from {filename}")
         return pincodes
     except FileNotFoundError:
-        print(f"Error: {filename} not found!")
+        logger.log(f"Error: {filename} not found!")
         return []
     except Exception as e:
-        print(f"Error reading pincodes: {e}")
+        logger.log(f"Error reading pincodes: {e}")
         return []
 
 def read_cities_from_csv(filename="city_list.csv"):
@@ -52,13 +288,13 @@ def read_cities_from_csv(filename="city_list.csv"):
                 
                 if city_value:
                     cities.append(city_value)
-        print(f"Loaded {len(cities)} cities from {filename}")
+        logger.log(f"Loaded {len(cities)} cities from {filename}")
         return cities
     except FileNotFoundError:
-        print(f"Error: {filename} not found!")
+        logger.log(f"Error: {filename} not found!")
         return []
     except Exception as e:
-        print(f"Error reading cities: {e}")
+        logger.log(f"Error reading cities: {e}")
         return []
 
 def append_to_csv(data, filename=OUTPUT_CSV):
@@ -76,8 +312,8 @@ def append_to_csv(data, filename=OUTPUT_CSV):
             # Write header if file is new
             if not file_exists:
                 writer.writerow([
-                    "Business_Name", "Contact_Person", "Phone", "Email", "Website",
-                    "City", "State", "Postal_Code", "Full_Address", "Rating", 
+                    "Business_Name", "Contact_Person", "Phone", "Email", "All_Emails_Found", "Website",
+                    "All_Websites_Found", "City", "State", "Postal_Code", "Full_Address", "Rating", 
                     "Review_Count", "Category", "Hours", "Plus_Code", "Located_In",
                     "Price_Level", "Amenities", "Google_Maps_URL", "Query", "Timestamp"
                 ])            
@@ -103,8 +339,8 @@ def append_to_json(data, filename=OUTPUT_JSON):
         
         # Convert data rows to dictionaries
         headers = [
-            "Business_Name", "Contact_Person", "Phone", "Email", "Website",
-            "City", "State", "Postal_Code", "Full_Address", "Rating", 
+            "Business_Name", "Contact_Person", "Phone", "Email", "All_Emails_Found", "Website",
+            "All_Websites_Found", "City", "State", "Postal_Code", "Full_Address", "Rating", 
             "Review_Count", "Category", "Hours", "Plus_Code", "Located_In",
             "Price_Level", "Amenities", "Google_Maps_URL", "Query", "Timestamp"
         ]
@@ -178,16 +414,60 @@ def parse_address(address_text):
     
     return city, state, postal_code
 
+def extract_all_emails(text):
+    """Extract all emails from text with business priority"""
+    email_patterns = [
+        r'\b[A-Za-z0-9._%+-]+@gmail\.com\b',  # Gmail addresses
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]*(?:business|company|corp|inc)\.[A-Za-z]{2,}\b',  # Business domains
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'  # General email pattern
+    ]
+    
+    all_emails = []
+    for pattern in email_patterns:
+        emails = re.findall(pattern, text, re.IGNORECASE)
+        all_emails.extend(emails)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_emails = []
+    for email in all_emails:
+        email_lower = email.lower()
+        if email_lower not in seen:
+            seen.add(email_lower)
+            unique_emails.append(email)
+    
+    return unique_emails
+
+def extract_emails_from_website(html_content):
+    """Extract emails from website HTML content, prioritizing mailto links"""
+    emails = []
+    
+    # Look for mailto: links first (highest priority)
+    mailto_patterns = [
+        r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+        r'href=["\']mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})["\']'
+    ]
+    
+    for pattern in mailto_patterns:
+        mailto_emails = re.findall(pattern, html_content, re.IGNORECASE)
+        emails.extend(mailto_emails)
+    
+    # If no mailto found, look for regular email patterns
+    if not emails:
+        emails = extract_all_emails(html_content)
+    
+    return emails
+
 async def scrape_location_query(pincode, country, query, worker_id):
     """Scrape Google Maps for gaming zones"""
     search_query = f"{query} {pincode} {country}"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    print(f"[Worker {worker_id}] Starting: {query} in {pincode}, {country}")
+    logger.log(f"[Worker {worker_id}] Starting: {query} in {pincode}, {country}")
     
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
+            browser = await p.chromium.launch(headless=True)  # Changed to headless for service
             context = await browser.new_context()
             page = await context.new_page()
             
@@ -195,7 +475,7 @@ async def scrape_location_query(pincode, country, query, worker_id):
             await context.route("/*.{png,jpg,jpeg,gif,svg,ico,webp}", lambda route: route.abort())
 
             search_url = f"https://www.google.com/maps/search/{search_query}/"
-            print(f"[Worker {worker_id}] Navigating to: {search_url}")
+            logger.log(f"[Worker {worker_id}] Navigating to: {search_url}")
             await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
             
             await page.wait_for_timeout(5000)
@@ -203,9 +483,9 @@ async def scrape_location_query(pincode, country, query, worker_id):
             try:
                 await page.wait_for_selector('.Nv2PK', timeout=20000)
             except:
-                print(f"[Worker {worker_id}] No results found")
+                logger.log(f"[Worker {worker_id}] No results found")
                 await browser.close()
-                return []
+                return 0
 
             # Scroll to load results
             scroll_attempts = 0
@@ -221,9 +501,9 @@ async def scrape_location_query(pincode, country, query, worker_id):
 
             # Get all business listings
             business_containers = await page.locator('.Nv2PK').all()
-            print(f"[Worker {worker_id}] Found {len(business_containers)} businesses")
+            logger.log(f"[Worker {worker_id}] Found {len(business_containers)} businesses")
             
-            results = []
+            total_results = 0
             
             for i, business in enumerate(business_containers):
                 try:
@@ -245,6 +525,10 @@ async def scrape_location_query(pincode, country, query, worker_id):
                                 break
                         except:
                             continue
+                    
+                    # Initialize collections for all found data
+                    all_emails_found = []
+                    all_websites_found = []
                     
                     # Extract rating and review count
                     rating = ""
@@ -317,12 +601,85 @@ async def scrape_location_query(pincode, country, query, worker_id):
                     except:
                         pass
                     
-                    # Extract website
+                    # Enhanced website extraction
                     website = ""
                     try:
-                        website_elem = page.locator('[data-item-id="authority"] a').first
-                        if await website_elem.count() > 0:
-                            website = await website_elem.get_attribute('href')
+                        # Extract website from the specific element
+                        website_text_elem = page.locator('.rogA2c.ITvuef .Io6YTe.fontBodyMedium.kR99db.fdkmkc').first
+                        if await website_text_elem.count() > 0:
+                            website_text = await website_text_elem.inner_text()
+                            # Clean up the website text and ensure it has proper protocol
+                            if website_text and not website_text.startswith(('http://', 'https://')):
+                                website = f"https://{website_text.strip()}"
+                            else:
+                                website = website_text.strip()
+                            if website:
+                                all_websites_found.append(website)
+                        
+                        # Enhanced email extraction from website
+                        if website:
+                            try:
+                                logger.log(f"[Worker {worker_id}] Visiting website: {website}")
+                                website_page = await context.new_page()
+                                await website_page.goto(website, timeout=20000)
+                                await website_page.wait_for_timeout(3000)
+                                
+                                # Get website content
+                                website_content = await website_page.content()
+                                
+                                # Look for mailto links and emails
+                                website_emails = extract_emails_from_website(website_content)
+                                all_emails_found.extend(website_emails)
+                                
+                                # Contact page extraction logic...
+                                contact_selectors = [
+                                    'a[href*="contact"]', 'a[href*="Contact"]', 
+                                    'a:has-text("Contact")', 'a:has-text("contact")',
+                                    'a:has-text("Contact Us")', 'a:has-text("CONTACT")',
+                                    'a[href*="about"]', 'a[href*="About"]'
+                                ]
+                                
+                                contact_links = []
+                                for selector in contact_selectors:
+                                    try:
+                                        links = await website_page.locator(selector).all()
+                                        contact_links.extend(links[:1])  # Take first from each selector
+                                        if len(contact_links) >= 2:  # Stop after finding 2 contact links
+                                            break
+                                    except:
+                                        continue
+                                
+                                for contact_link in contact_links[:2]:  # Check first 2 contact links
+                                    try:
+                                        contact_href = await contact_link.get_attribute('href')
+                                        if contact_href and not contact_href.startswith('mailto:'):
+                                            # Handle relative URLs
+                                            if contact_href.startswith('/'):
+                                                contact_href = f"{website.rstrip('/')}{contact_href}"
+                                            elif not contact_href.startswith('http'):
+                                                contact_href = f"{website.rstrip('/')}/{contact_href.lstrip('/')}"
+                                            
+                                            if contact_href not in all_websites_found:
+                                                all_websites_found.append(contact_href)
+                                            
+                                            contact_page = await context.new_page()
+                                            await contact_page.goto(contact_href, timeout=15000)
+                                            await contact_page.wait_for_timeout(2000)
+                                            
+                                            contact_content = await contact_page.content()
+                                            contact_emails = extract_emails_from_website(contact_content)
+                                            all_emails_found.extend(contact_emails)
+                                            
+                                            await contact_page.close()
+                                            break  # Found contact page, no need to check more
+                                    except Exception as e:
+                                        logger.log(f"[Worker {worker_id}] Error visiting contact page: {e}")
+                                        continue
+                                
+                                await website_page.close()
+                                
+                            except Exception as e:
+                                logger.log(f"[Worker {worker_id}] Error visiting website {website}: {e}")
                     except:
                         pass
                     
@@ -366,17 +723,31 @@ async def scrape_location_query(pincode, country, query, worker_id):
                     except:
                         pass
                     
-                    # Extract email from website or reviews
+                    # Extract email from page content and reviews
                     email_address = ""
                     try:
+                        # Get page content to search for emails
+                        page_content = await page.content()
+                        page_emails = extract_all_emails(page_content)
+                        all_emails_found.extend(page_emails)
+                        
                         # Look for website link first
                         if website and '@' in website:
                             _, email_address = extract_contact_info(website)
                         
-                        # If no email found, search in reviews and content
-                        if not email_address:
-                            page_content = await page.content()
-                            _, email_address = extract_contact_info(page_content)
+                        # If no email found, use first email from page
+                        if not email_address and page_emails:
+                            email_address = page_emails[0]
+                        
+                        # Remove duplicates from all_emails_found
+                        unique_emails = []
+                        seen_emails = set()
+                        for email in all_emails_found:
+                            if email.lower() not in seen_emails:
+                                unique_emails.append(email)
+                                seen_emails.add(email.lower())
+                        all_emails_found = unique_emails
+                        
                     except:
                         pass
                     
@@ -419,12 +790,15 @@ async def scrape_location_query(pincode, country, query, worker_id):
 
                     # Only add if we have essential data
                     if business_name and business_name.strip():
-                        results.append([
+                        # Prepare the result data
+                        result_data = [[
                             business_name.strip(),
                             contact_person_name.strip(),
                             contact_number.strip(),
                             email_address.strip(),
+                            "; ".join(all_emails_found) if all_emails_found else "",
                             website.strip() if website else "",
+                            "; ".join(all_websites_found) if all_websites_found else "",
                             city.strip(),
                             state.strip(),
                             postal_code.strip(),
@@ -440,28 +814,31 @@ async def scrape_location_query(pincode, country, query, worker_id):
                             google_maps_url.strip(),
                             query,
                             timestamp
-                        ])
-                        print(f"[Worker {worker_id}] Extracted: {business_name}")
+                        ]]
+                        
+                        # Save immediately after each business
+                        append_to_csv(result_data)
+                        append_to_json(result_data)
+                        total_results += 1
+                        
+                        logger.log(f"[Worker {worker_id}] Extracted & Saved: {business_name}")
+                        if all_emails_found:
+                            logger.log(f"[Worker {worker_id}] All emails: {', '.join(all_emails_found)}")
+                        if all_websites_found:
+                            logger.log(f"[Worker {worker_id} All websites: {', '.join(all_websites_found)}")
                 
                 except Exception as e:
-                    print(f"[Worker {worker_id}] Error extracting business {i}: {e}")
+                    logger.log(f"[Worker {worker_id}] Error extracting business {i}: {e}")
                     continue
 
             await browser.close()
             
-            # Save results
-            if results:
-                append_to_csv(results)
-                append_to_json(results)
-                print(f"[Worker {worker_id}] Completed: {len(results)} gaming zones found")
-            else:
-                print(f"[Worker {worker_id}] No results found")
-            
-            return results
+            logger.log(f"[Worker {worker_id}] Completed: {total_results} businesses processed and saved")
+            return total_results
 
     except Exception as e:
-        print(f"[Worker {worker_id}] Error scraping: {e}")
-        return []
+        logger.log(f"[Worker {worker_id}] Error scraping: {e}")
+        return 0
 
 def run_scraping_task(location, location_type, query, worker_id):
     """Wrapper to run async scraping in process"""
@@ -472,33 +849,88 @@ def run_scraping_task(location, location_type, query, worker_id):
     finally:
         loop.close()
 
-def main():
-    """Main function to orchestrate scraping"""
-    print("Starting Google Maps scraper for Gaming Zones in USA/Canada...")
+def run_continuous_scraping():
+    """Run scraping continuously as a service"""
+    logger.log("Starting Gaming Zones Scraper Service...")
+    
+    # Create PID file when running as service
+    create_pid_file()
+    
+    # Register cleanup on exit
+    import atexit
+    atexit.register(remove_pid_file)
+    
+    # Set daemon mode flag for service mode
+    logger.daemon_mode = True
+    
+    # Set environment for headless browser (Linux/Unix only)
+    if platform.system().lower() != "windows":
+        # Don't set DISPLAY if we're in a headless environment
+        if 'DISPLAY' not in os.environ:
+            os.environ['DISPLAY'] = ':0'  # Try default display first
+    
+    cycle_count = 0
+    
+    while True:
+        try:
+            cycle_count += 1
+            logger.log(f"Starting scraping cycle #{cycle_count}")
+            
+            main_scraping_cycle()
+            
+            # Wait before next cycle (configurable)
+            wait_time = int(os.environ.get('SCRAPER_CYCLE_INTERVAL', 3600))  # Default 1 hour
+            logger.log(f"Scraping cycle #{cycle_count} completed. Waiting {wait_time} seconds before next cycle...")
+            
+            # Sleep in smaller chunks to allow signal handling
+            sleep_chunks = max(1, wait_time // 60)  # At least 1 chunk
+            chunk_size = wait_time // sleep_chunks
+            
+            for i in range(sleep_chunks):
+                time.sleep(chunk_size)
+                if i % 10 == 0 and i > 0:  # Log every 10 chunks
+                    remaining = wait_time - (i * chunk_size)
+                    logger.log(f"Next cycle in {remaining} seconds...")
+            
+            # Sleep remaining time
+            remaining_sleep = wait_time % chunk_size
+            if remaining_sleep > 0:
+                time.sleep(remaining_sleep)
+            
+        except KeyboardInterrupt:
+            logger.log("Service interrupted by user")
+            break
+        except Exception as e:
+            logger.log(f"Error in scraping cycle: {e}")
+            # Wait 5 minutes before retrying
+            logger.log("Waiting 5 minutes before retry...")
+            time.sleep(300)
+        finally:
+            # Ensure we clean up resources
+            import gc
+            gc.collect()
+
+def main_scraping_cycle():
+    """Single scraping cycle"""
+    logger.log("Starting scraping cycle...")
     
     # Read pincodes
     pincodes = read_pincodes_from_csv()
     
     if not pincodes:
-        print("No pincodes found. Exiting...")
+        logger.log("No pincodes found. Skipping cycle...")
         return
     
     # Create tasks for both countries
     tasks = []
-    countries = ["USA", "Canada"]
+    countries = ["USA"]
     
     for pincode in pincodes:
         for country in countries:
             for query in QUERIES:
                 tasks.append((pincode, country, query))
     
-    print(f"Total tasks: {len(tasks)}")
-    
-    # Clear output files
-    if os.path.exists(OUTPUT_CSV):
-        os.remove(OUTPUT_CSV)
-    if os.path.exists(OUTPUT_JSON):
-        os.remove(OUTPUT_JSON)
+    logger.log(f"Total tasks: {len(tasks)}")
     
     start_time = time.time()
     total_results = 0
@@ -515,20 +947,128 @@ def main():
         for i, future in enumerate(futures):
             try:
                 results = future.result(timeout=300)
-                total_results += len(results)
-                print(f"Task {i+1}/{len(tasks)} completed")
+                total_results += results
+                logger.log(f"Task {i+1}/{len(tasks)} completed")
             except Exception as e:
-                print(f"Task {i+1} failed: {e}")
+                logger.log(f"Task {i+1} failed: {e}")
 
     end_time = time.time()
     duration = end_time - start_time
     
-    print(f"\n{'='*50}")
-    print(f"Scraping completed!")
-    print(f"Total results: {total_results}")
-    print(f"Total time: {duration:.2f} seconds")
-    print(f"Results saved to: {OUTPUT_CSV} and {OUTPUT_JSON}")
-    print(f"{'='*50}")
+    logger.log(f"Scraping cycle completed! Total results: {total_results}, Time: {duration:.2f} seconds")
+
+def main():
+    """Main function to orchestrate scraping"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Gaming Zones Scraper')
+    parser.add_argument('--daemon', action='store_true', help='Run as daemon (survives SSH disconnect)')
+    parser.add_argument('--service', action='store_true', help='Run as background service')
+    parser.add_argument('--once', action='store_true', help='Run once and exit')
+    parser.add_argument('--stop', action='store_true', help='Stop running daemon')
+    parser.add_argument('--status', action='store_true', help='Check daemon status')
+    parser.add_argument('--logs', action='store_true', help='Show current logs')
+    parser.add_argument('--kill', action='store_true', help='Force kill all instances')
+    
+    args = parser.parse_args()
+    
+    if args.kill:
+        # Force kill all Python processes running this script
+        import psutil
+        current_script = os.path.basename(__file__)
+        killed = 0
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                if proc.info['name'] == 'python.exe' or proc.info['name'] == 'python':
+                    cmdline = proc.info['cmdline']
+                    if cmdline and any(current_script in arg for arg in cmdline):
+                        if proc.pid != os.getpid():  # Don't kill ourselves
+                            proc.kill()
+                            killed += 1
+                            print(f"Killed process {proc.pid}")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        
+        print(f"Killed {killed} processes")
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+            print("Removed PID file")
+        return
+    
+    if args.stop:
+        if stop_daemon():
+            print("Daemon stopped successfully")
+        else:
+            print("Failed to stop daemon or daemon not running")
+        return
+    
+    if args.status:
+        if is_running():
+            print("Gaming Zones Scraper daemon is running")
+            try:
+                with open(PID_FILE, 'r') as f:
+                    pid = f.read().strip()
+                print(f"PID: {pid}")
+                
+                # Show additional process info
+                if psutil.pid_exists(int(pid)):
+                    process = psutil.Process(int(pid))
+                    print(f"Status: {process.status()}")
+                    try:
+                        print(f"CPU: {process.cpu_percent()}%")
+                        print(f"Memory: {process.memory_info().rss / 1024 / 1024:.1f} MB")
+                        print(f"Running since: {datetime.fromtimestamp(process.create_time()).strftime('%Y-%m-%d %H:%M:%S')}")
+                    except:
+                        pass
+            except Exception as e:
+                print(f"Error getting process info: {e}")
+        else:
+            print("Gaming Zones Scraper daemon is not running")
+        return
+    
+    if args.logs:
+        try:
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    if content:
+                        print(content)
+                    else:
+                        print("Log file is empty")
+            else:
+                print("No log file found")
+        except Exception as e:
+            print(f"Error reading log file: {e}")
+        return
+    
+    if args.daemon:
+        if is_running():
+            print("Daemon is already running. Use --stop to stop it first.")
+            return
+        
+        print("Starting daemon...")
+        try:
+            daemonize()
+        except Exception as e:
+            print(f"Failed to start daemon: {e}")
+            print("Try using --service instead for testing")
+            return
+            
+        logger.log("Daemon started successfully")
+        run_continuous_scraping()
+        
+    elif args.service:
+        if is_running():
+            print("Service is already running. Use --stop to stop it first.")
+            return
+            
+        logger.log("Starting as background service...")
+        run_continuous_scraping()
+        
+    else:
+        logger.log("Running single scraping cycle...")
+        main_scraping_cycle()
 
 if __name__ == "__main__":
     main()

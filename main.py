@@ -99,8 +99,8 @@ def append_to_csv(data, filename=OUTPUT_CSV):
             if not file_exists:
                 writer.writerow([
                     "Institute_University_Name", "Contact_Person_Name", "Designation", 
-                    "Contact_Number", "Email_Address", "City", "State", "Postal_Code", 
-                    "Full_Address", "Website", "Rating", "Review_Count", "Category", 
+                    "Contact_Number", "Email_Address", "All_Emails_Found", "City", "State", "Postal_Code", 
+                    "Full_Address", "Website", "All_Websites_Found", "Rating", "Review_Count", "Category", 
                     "Google_Maps_URL", "Country", "Query", "Timestamp"
                 ])            
             # Write data rows
@@ -126,8 +126,8 @@ def append_to_json(data, filename=OUTPUT_JSON):
         # Convert data rows to dictionaries
         headers = [
             "Institute_University_Name", "Contact_Person_Name", "Designation", 
-            "Contact_Number", "Email_Address", "City", "State", "Postal_Code", 
-            "Full_Address", "Website", "Rating", "Review_Count", "Category", 
+            "Contact_Number", "Email_Address", "All_Emails_Found", "City", "State", "Postal_Code", 
+            "Full_Address", "Website", "All_Websites_Found", "Rating", "Review_Count", "Category", 
             "Google_Maps_URL", "Country", "Query", "Timestamp"
         ]
         new_records = []
@@ -154,7 +154,15 @@ def extract_contact_info(text):
         r'\+?91[-.\s]?\(?([0-9]{3,4})\)?[-.\s]?([0-9]{3,4})[-.\s]?([0-9]{3,4})',  # India
         r'\(?([0-9]{3,4})\)?[-.\s]?([0-9]{3,4})[-.\s]?([0-9]{3,4})'  # General
     ]
-    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    
+    # Enhanced email patterns with priority for institutional emails
+    email_patterns = [
+        r'\b[A-Za-z0-9._%+-]+@gmail\.com\b',  # Gmail addresses (high priority for institutes)
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]*(?:edu|ac|university|college|medical|pharma)\.[A-Za-z]{2,}\b',  # Educational domains
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.edu\b',  # .edu domains
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.ac\.[A-Za-z]{2,}\b',  # .ac domains
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'  # General email pattern
+    ]
     
     phone_number = ""
     for pattern in phone_patterns:
@@ -165,10 +173,71 @@ def extract_contact_info(text):
                 phone_number = "-".join([g for g in groups if g])
                 break
     
-    emails = re.findall(email_pattern, text)
-    email = emails[0] if emails else ""
+    # Find all emails and prioritize institutional ones
+    all_emails = []
+    for pattern in email_patterns:
+        emails = re.findall(pattern, text, re.IGNORECASE)
+        all_emails.extend(emails)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_emails = []
+    for email in all_emails:
+        email_lower = email.lower()
+        if email_lower not in seen:
+            seen.add(email_lower)
+            unique_emails.append(email)
+    
+    # Return the first email found (prioritized by pattern order)
+    email = unique_emails[0] if unique_emails else ""
     
     return phone_number, email
+
+def extract_all_emails(text):
+    """Extract all emails from text with institutional priority"""
+    email_patterns = [
+        r'\b[A-Za-z0-9._%+-]+@gmail\.com\b',  # Gmail addresses
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]*(?:edu|ac|university|college|medical|pharma)\.[A-Za-z]{2,}\b',  # Educational domains
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.edu\b',  # .edu domains
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.ac\.[A-Za-z]{2,}\b',  # .ac domains
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'  # General email pattern
+    ]
+    
+    all_emails = []
+    for pattern in email_patterns:
+        emails = re.findall(pattern, text, re.IGNORECASE)
+        all_emails.extend(emails)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_emails = []
+    for email in all_emails:
+        email_lower = email.lower()
+        if email_lower not in seen:
+            seen.add(email_lower)
+            unique_emails.append(email)
+    
+    return unique_emails
+
+def extract_emails_from_website(html_content):
+    """Extract emails from website HTML content, prioritizing mailto links"""
+    emails = []
+    
+    # Look for mailto: links first (highest priority)
+    mailto_patterns = [
+        r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+        r'href=["\']mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})["\']'
+    ]
+    
+    for pattern in mailto_patterns:
+        mailto_emails = re.findall(pattern, html_content, re.IGNORECASE)
+        emails.extend(mailto_emails)
+    
+    # If no mailto found, look for regular email patterns
+    if not emails:
+        emails = extract_all_emails(html_content)
+    
+    return emails
 
 def parse_address(address_text):
     """Parse address into components"""
@@ -291,7 +360,7 @@ async def scrape_location_query(pincode, country, query, worker_id):
             business_containers = await page.locator('.Nv2PK').all()
             print(f"[Worker {worker_id}] Found {len(business_containers)} institutions")
             
-            results = []
+            total_results = 0
             
             for i, business in enumerate(business_containers):
                 try:
@@ -357,15 +426,123 @@ async def scrape_location_query(pincode, country, query, worker_id):
                     # Parse address components
                     city, state, postal_code = parse_address(full_address)
                     
-                    # Extract website
-                    website = ""
-                    try:
-                        website_elem = page.locator('[data-item-id="authority"] a').first
-                        if await website_elem.count() > 0:
-                            website = await website_elem.get_attribute('href')
-                    except:
-                        pass
+                    # Initialize collections for all found data
+                    all_emails_found = []
+                    all_websites_found = []
                     
+                    # Extract website and enhanced email search
+                    website = ""
+                    additional_emails = []
+                    try:
+                        # Extract website from the specific element you mentioned
+                        website_text_elem = page.locator('.rogA2c.ITvuef .Io6YTe.fontBodyMedium.kR99db.fdkmkc').first
+                        if await website_text_elem.count() > 0:
+                            website_text = await website_text_elem.inner_text()
+                            # Clean up the website text and ensure it has proper protocol
+                            if website_text and not website_text.startswith(('http://', 'https://')):
+                                website = f"https://{website_text.strip()}"
+                            else:
+                                website = website_text.strip()
+                            if website:
+                                all_websites_found.append(website)
+                        
+                        # Fallback: Extract website from Google Maps authority link
+                        if not website:
+                            website_elem = page.locator('[data-item-id="authority"] a').first
+                            if await website_elem.count() > 0:
+                                website_href = await website_elem.get_attribute('href')
+                                # Skip schema.org and other unwanted URLs
+                                if website_href and not any(skip_url in website_href.lower() for skip_url in ['schema.org', 'google.com', 'maps.google']):
+                                    website = website_href
+                                    all_websites_found.append(website)
+                        
+                        # Additional fallback: look for website in page content
+                        if not website:
+                            website_patterns = [
+                                r'https?://(?:www\.)?([A-Za-z0-9.-]+\.(?:com|edu|org|net|gov|ac\.uk|ac\.in))',
+                                r'www\.([A-Za-z0-9.-]+\.(?:com|edu|org|net|gov|ac\.uk|ac\.in))',
+                                r'([A-Za-z0-9.-]+\.(?:edu|ac\.uk|ac\.in|com|org|net|gov))'
+                            ]
+                            page_content = await page.content()
+                            for pattern in website_patterns:
+                                matches = re.findall(pattern, page_content, re.IGNORECASE)
+                                for match in matches:
+                                    potential_url = match if match.startswith('http') else f"https://{match}"
+                                    # Skip unwanted domains
+                                    if not any(skip_domain in potential_url.lower() for skip_domain in ['schema.org', 'google.com', 'gstatic.com', 'googleapis.com']):
+                                        if not website:
+                                            website = potential_url
+                                        if potential_url not in all_websites_found:
+                                            all_websites_found.append(potential_url)
+                        
+                        # Enhanced email extraction from website
+                        if website:
+                            try:
+                                print(f"[Worker {worker_id}] Visiting website: {website}")
+                                website_page = await context.new_page()
+                                await website_page.goto(website, timeout=20000)
+                                await website_page.wait_for_timeout(3000)
+                                
+                                # Get website content
+                                website_content = await website_page.content()
+                                
+                                # Look for mailto links and emails
+                                website_emails = extract_emails_from_website(website_content)
+                                additional_emails.extend(website_emails)
+                                
+                                # Also look for contact page links
+                                contact_selectors = [
+                                    'a[href*="contact"]', 'a[href*="Contact"]', 
+                                    'a:has-text("Contact")', 'a:has-text("contact")',
+                                    'a:has-text("Contact Us")', 'a:has-text("CONTACT")',
+                                    'a[href*="about"]', 'a[href*="About"]'
+                                ]
+                                
+                                contact_links = []
+                                for selector in contact_selectors:
+                                    try:
+                                        links = await website_page.locator(selector).all()
+                                        contact_links.extend(links[:1])  # Take first from each selector
+                                        if len(contact_links) >= 2:  # Stop after finding 2 contact links
+                                            break
+                                    except:
+                                        continue
+                                
+                                for contact_link in contact_links[:2]:  # Check first 2 contact links
+                                    try:
+                                        contact_href = await contact_link.get_attribute('href')
+                                        if contact_href and not contact_href.startswith('mailto:'):
+                                            # Handle relative URLs
+                                            if contact_href.startswith('/'):
+                                                contact_href = f"{website.rstrip('/')}{contact_href}"
+                                            elif not contact_href.startswith('http'):
+                                                contact_href = f"{website.rstrip('/')}/{contact_href.lstrip('/')}"
+                                            
+                                            if contact_href not in all_websites_found:
+                                                all_websites_found.append(contact_href)
+                                            
+                                            contact_page = await context.new_page()
+                                            await contact_page.goto(contact_href, timeout=15000)
+                                            await contact_page.wait_for_timeout(2000)
+                                            
+                                            contact_content = await contact_page.content()
+                                            contact_emails = extract_emails_from_website(contact_content)
+                                            additional_emails.extend(contact_emails)
+                                            
+                                            await contact_page.close()
+                                            break  # Found contact page, no need to check more
+                                    except Exception as e:
+                                        print(f"[Worker {worker_id}] Error visiting contact page: {e}")
+                                        continue
+                                
+                                await website_page.close()
+                                
+                            except Exception as e:
+                                print(f"[Worker {worker_id}] Error visiting website {website}: {e}")
+                    except Exception as e:
+                        print(f"[Worker {worker_id}] Error extracting website: {e}")
+                        pass
+
                     # Extract phone number
                     contact_number = ""
                     phone_selectors = [
@@ -385,6 +562,7 @@ async def scrape_location_query(pincode, country, query, worker_id):
                     
                     # Extract email and look for designation/contact person
                     email_address = ""
+                    gmail_address = ""
                     designation = ""
                     contact_person_name = ""
                     
@@ -392,6 +570,42 @@ async def scrape_location_query(pincode, country, query, worker_id):
                         # Get page content to search for emails and designations
                         page_content = await page.content()
                         _, email_address = extract_contact_info(page_content)
+                        
+                        # Extract all emails to find Gmail addresses
+                        page_emails = extract_all_emails(page_content)
+                        all_emails_found.extend(page_emails)
+                        
+                        # Prioritize Gmail addresses
+                        gmail_addresses = [email for email in page_emails if 'gmail.com' in email.lower()]
+                        if gmail_addresses:
+                            gmail_address = gmail_addresses[0]  # Take the first Gmail address
+                        
+                        # If we have additional emails from website, merge them
+                        if additional_emails:
+                            all_emails_found.extend(additional_emails)
+                            # Update Gmail address if found on website
+                            website_gmail = [email for email in additional_emails if 'gmail.com' in email.lower()]
+                            if website_gmail and not gmail_address:
+                                gmail_address = website_gmail[0]
+                            
+                            # Prioritize institutional emails from website
+                            institutional_emails = [email for email in additional_emails 
+                                                  if any(domain in email.lower() for domain in ['.edu', '.ac.', 'university', 'college', 'medical', 'pharma'])]
+                            if institutional_emails and not email_address:
+                                email_address = institutional_emails[0]
+                        
+                        # Use Gmail address as primary email if no other institutional email found
+                        if gmail_address and not email_address:
+                            email_address = gmail_address
+                        
+                        # Remove duplicates from all_emails_found
+                        unique_emails = []
+                        seen_emails = set()
+                        for email in all_emails_found:
+                            if email.lower() not in seen_emails:
+                                unique_emails.append(email)
+                                seen_emails.add(email.lower())
+                        all_emails_found = unique_emails
                         
                         # Look for designation and contact person in reviews, descriptions, etc.
                         desc_elem = page.locator('.PYvSYb').first
@@ -430,17 +644,20 @@ async def scrape_location_query(pincode, country, query, worker_id):
 
                     # Only add if we have essential data (institution name)
                     if institution_name and institution_name.strip():
-                        results.append([
+                        # Prepare the result data
+                        result_data = [[
                             institution_name.strip(),
                             contact_person_name.strip(),
                             designation.strip(),
                             contact_number.strip(),
                             email_address.strip(),
+                            "; ".join(all_emails_found) if all_emails_found else "",
                             city.strip(),
                             state.strip(),
                             postal_code.strip(),
                             full_address.strip(),
                             website.strip() if website else "",
+                            "; ".join(all_websites_found) if all_websites_found else "",
                             rating.strip(),
                             review_count.strip(),
                             category.strip(),
@@ -448,28 +665,37 @@ async def scrape_location_query(pincode, country, query, worker_id):
                             country,
                             query,
                             timestamp
-                        ])
-                        print(f"[Worker {worker_id}] Extracted: {institution_name}")
-                
+                        ]]
+                        
+                        # Save immediately after each institute
+                        append_to_csv(result_data)
+                        append_to_json(result_data)
+                        total_results += 1
+                        
+                        print(f"[Worker {worker_id}] Extracted & Saved: {institution_name}")
+                        if gmail_address:
+                            print(f"[Worker {worker_id}] Found Gmail: {gmail_address}")
+                        if email_address and email_address != gmail_address:
+                            print(f"[Worker {worker_id}] Found Email: {email_address}")
+                        if all_emails_found:
+                            print(f"[Worker {worker_id}] All emails: {', '.join(all_emails_found)}")
+                        if website:
+                            print(f"[Worker {worker_id}] Found Website: {website}")
+                        if all_websites_found:
+                            print(f"[Worker {worker_id}] All websites: {', '.join(all_websites_found)}")
+
                 except Exception as e:
                     print(f"[Worker {worker_id}] Error extracting institution {i}: {e}")
                     continue
 
             await browser.close()
             
-            # Save results
-            if results:
-                append_to_csv(results)
-                append_to_json(results)
-                print(f"[Worker {worker_id}] Completed: {len(results)} institutions found")
-            else:
-                print(f"[Worker {worker_id}] No results found")
-            
-            return results
+            print(f"[Worker {worker_id}] Completed: {total_results} institutions processed and saved")
+            return total_results
 
     except Exception as e:
         print(f"[Worker {worker_id}] Error scraping: {e}")
-        return []
+        return 0
 
 def run_scraping_task(location, country, query, worker_id):
     """Wrapper to run async scraping in process"""
